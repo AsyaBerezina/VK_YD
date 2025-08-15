@@ -1,9 +1,7 @@
-#!/usr/bin/env python3
 """
 Программа для резервного копирования фотографий VK на Яндекс.Диск.
 
-Автор: Курсовая работа
-Версия: 1.0.0
+Автор: Березина Анастасия
 """
 
 import json
@@ -21,10 +19,9 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  
+    pass 
 
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -56,6 +53,102 @@ class VKPhotoBackup:
             'Authorization': f'OAuth {yandex_token}',
             'Content-Type': 'application/json'
         })
+    
+    def check_yandex_disk_availability(self) -> bool:
+        """
+        Проверка доступности Яндекс.Диска и валидности токена.
+        
+        Returns:
+            True если Яндекс.Диск доступен
+            
+        Raises:
+            requests.RequestException: Ошибка при подключении к Яндекс.Диску
+            ValueError: Невалидный токен
+        """
+        logger.info("Проверяем доступность Яндекс.Диска...")
+        
+        try:
+            response = self.session.get(
+                f'{self.YANDEX_API_BASE_URL}/resources',
+                params={'path': '/'},
+                timeout=30
+            )
+            
+            if response.status_code == 401:
+                raise ValueError("Невалидный токен Яндекс.Диска")
+            elif response.status_code == 200:
+                logger.info(" Яндекс.Диск доступен")
+                return True
+            else:
+                response.raise_for_status()
+                
+        except requests.RequestException as e:
+            logger.error(f"Ошибка при подключении к Яндекс.Диску: {e}")
+            raise
+    
+    def check_vk_token_validity(self) -> bool:
+        """
+        Проверка валидности VK токена.
+        
+        Returns:
+            True если токен валидный
+            
+        Raises:
+            requests.RequestException: Ошибка при подключении к VK API
+            ValueError: Невалидный токен
+        """
+        logger.info("Проверяем валидность VK токена...")
+        
+        params = {
+            'access_token': self.vk_token,
+            'v': self.VK_API_VERSION
+        }
+        
+        try:
+            response = requests.get(
+                f'{self.VK_API_BASE_URL}/account.getProfileInfo',
+                params=params,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if 'error' in data:
+                error_code = data['error'].get('error_code', 0)
+                if error_code == 5:  # User authorization failed
+                    raise ValueError("Невалидный токен VK")
+                else:
+                    raise ValueError(f"VK API Error: {data['error'].get('error_msg', 'Неизвестная ошибка')}")
+            
+            logger.info("VK токен валидный")
+            return True
+            
+        except requests.RequestException as e:
+            logger.error(f"Ошибка при подключении к VK API: {e}")
+            raise
+    
+    def check_folder_exists(self, folder_name: str) -> bool:
+        """
+        Проверка существования папки на Яндекс.Диске.
+        
+        Args:
+            folder_name: Имя папки для проверки
+            
+        Returns:
+            True если папка существует
+        """
+        try:
+            response = self.session.get(
+                f'{self.YANDEX_API_BASE_URL}/resources',
+                params={'path': f'/{folder_name}'},
+                timeout=30
+            )
+            
+            return response.status_code == 200
+            
+        except requests.RequestException:
+            return False
     
     def get_profile_photos(self, user_id: str, count: int = 5) -> List[Dict]:
         """
@@ -124,6 +217,7 @@ class VKPhotoBackup:
         if not sizes:
             raise ValueError("Размеры фотографии не найдены")
         
+        # Находим фотографию с максимальным разрешением
         max_size = 0
         best_photo = sizes[0]
         
@@ -135,38 +229,52 @@ class VKPhotoBackup:
         
         return best_photo['url'], best_photo['type']
     
-    def generate_filename(self, photo: Dict, photos: List[Dict]) -> str:
+    def generate_filename(self, photo: Dict, photos: List[Dict], used_filenames: set) -> str:
         """
-        Генерация имени файла на основе количества лайков.
+        Генерация уникального имени файла на основе количества лайков.
         
         Args:
             photo: Данные фотографии
             photos: Список всех фотографий (для проверки дубликатов)
+            used_filenames: Множество уже использованных имён файлов
             
         Returns:
-            Имя файла
+            Уникальное имя файла
         """
         likes_count = photo.get('likes', {}).get('count', 0)
+        photo_id = photo.get('id', 0)
         
-        # есть ли другие фотографии с таким же количеством лайков
+        # Проверяем, есть ли другие фотографии с таким же количеством лайков
         same_likes_photos = [
             p for p in photos 
             if p.get('likes', {}).get('count', 0) == likes_count
         ]
         
+        # Базовое имя файла
         if len(same_likes_photos) > 1:
             # Добавляем дату, если есть дубликаты по лайкам
             photo_date = datetime.fromtimestamp(photo.get('date', 0))
             date_str = photo_date.strftime('%Y-%m-%d')
-            filename = f"{likes_count}_{date_str}.jpg"
+            base_filename = f"{likes_count}_{date_str}"
         else:
-            filename = f"{likes_count}.jpg"
+            base_filename = f"{likes_count}"
         
+        filename = f"{base_filename}.jpg"
+        counter = 1
+        
+        while filename in used_filenames:
+            if counter == 1:
+                filename = f"{base_filename}_{photo_id}.jpg"
+            else:
+                filename = f"{base_filename}_{photo_id}_{counter}.jpg"
+            counter += 1
+        
+        used_filenames.add(filename)
         return filename
     
     def create_yandex_folder(self, folder_name: str) -> bool:
         """
-        Создание папки на Яндекс.Диске.
+        Создание папки на Яндекс.Диске с проверкой существования.
         
         Args:
             folder_name: Имя папки
@@ -177,7 +285,13 @@ class VKPhotoBackup:
         Raises:
             requests.RequestException: Ошибка при создании папки
         """
-        logger.info(f"Создаём папку '{folder_name}' на Яндекс.Диске")
+        logger.info(f"Проверяем существование папки '{folder_name}' на Яндекс.Диске")
+        
+        if self.check_folder_exists(folder_name):
+            logger.info("Папка уже существует")
+            return True
+        
+        logger.info(f"Создаём новую папку '{folder_name}' на Яндекс.Диске")
         
         try:
             response = self.session.put(
@@ -190,7 +304,7 @@ class VKPhotoBackup:
                 logger.info("Папка успешно создана")
                 return True
             elif response.status_code == 409:
-                logger.info("Папка уже существует")
+                logger.info("Папка уже существует (создалась параллельно)")
                 return True
             else:
                 response.raise_for_status()
@@ -283,12 +397,18 @@ class VKPhotoBackup:
         logger.info("=" * 50)
         
         try:
-            # Получаем фотографии из VK
+            logger.info("Выполняем предварительные проверки...")
+            self.check_vk_token_validity()
+            self.check_yandex_disk_availability()
+            
             photos = self.get_profile_photos(user_id, count)
             
             if not photos:
-                logger.warning("Фотографии не найдены")
-                return {'success': False, 'message': 'Фотографии не найдены'}
+                logger.warning("У пользователя нет фотографий в профиле")
+                return {
+                    'success': False, 
+                    'message': 'У пользователя нет фотографий в профиле или профиль закрыт'
+                }
             
             def get_max_size(photo):
                 sizes = photo.get('sizes', [])
@@ -298,25 +418,22 @@ class VKPhotoBackup:
             
             photos.sort(key=get_max_size, reverse=True)
             
-            # Создаём папку на Яндекс.Диске
             folder_name = f"VK_Photos_{user_id}_{datetime.now().strftime('%Y-%m-%d')}"
             self.create_yandex_folder(folder_name)
             
             photos_info = []
             successful_uploads = 0
+            used_filenames = set()  # set для отслеживания уникальности имён файлов
             
             logger.info(f"Загружаем {len(photos)} фотографий...")
             
             with tqdm(total=len(photos), desc="Загрузка фото", unit="фото") as pbar:
                 for i, photo in enumerate(photos):
                     try:
-                        # Получаем фотографию максимального размера
                         photo_url, size_type = self.get_largest_photo_size(photo)
                         
-                        # Генерируем имя файла
-                        filename = self.generate_filename(photo, photos)
+                        filename = self.generate_filename(photo, photos, used_filenames)
                         
-                        # Загружаем на Яндекс.Диск
                         self.upload_photo_to_yandex(photo_url, filename, folder_name)
                         
                         photos_info.append({
@@ -338,6 +455,13 @@ class VKPhotoBackup:
                     finally:
                         pbar.update(1)
             
+            if successful_uploads == 0:
+                logger.error("Ни одна фотография не была загружена")
+                return {
+                    'success': False,
+                    'message': 'Ни одна фотография не была загружена. Проверьте доступность сервисов.'
+                }
+            
             json_filename = self.save_photos_info(photos_info, user_id)
             
             result = {
@@ -358,12 +482,51 @@ class VKPhotoBackup:
             
             return result
             
+        except ValueError as e:
+            logger.error(f"Ошибка валидации: {e}")
+            return {
+                'success': False,
+                'message': str(e)
+            }
         except Exception as e:
             logger.error(f"Критическая ошибка: {e}")
             return {
                 'success': False,
                 'message': str(e)
             }
+
+
+def validate_and_clean_user_id(user_id: str) -> str:
+    """
+    Валидация и очистка ID пользователя VK.
+    
+    Args:
+        user_id: ID пользователя (может содержать префикс 'id' или '@')
+        
+    Returns:
+        Очищенный числовой ID
+        
+    Raises:
+        ValueError: Если ID некорректный
+    """
+    user_id = user_id.strip()
+    
+    if user_id.startswith('https://vk.com/'):
+        user_id = user_id.replace('https://vk.com/', '')
+    
+    if user_id.startswith('id'):
+        user_id = user_id[2:]  
+    elif user_id.startswith('@'):
+        user_id = user_id[1:]  
+    
+    if not user_id.isdigit():
+        raise ValueError(
+            f"Некорректный ID пользователя: '{user_id}'\n"
+            f"ID должен содержать только цифры или быть в формате 'id123456'\n"
+            f"Примеры правильного ввода: 53688675, id53688675, @id53688675"
+        )
+    
+    return user_id
 
 
 def get_user_input() -> Tuple[str, int]:
@@ -376,12 +539,23 @@ def get_user_input() -> Tuple[str, int]:
     print("=" * 50)
     print("РЕЗЕРВНОЕ КОПИРОВАНИЕ ФОТОГРАФИЙ VK")
     print("=" * 50)
+    print("Примеры ввода ID: 53688675, id53688675, @id53688675")
+    print("   или скопируйте ссылку: https://vk.com/id53688675")
+    print()
     
     while True:
-        user_id = input("Введите ID пользователя VK: ").strip()
-        if user_id:
+        user_input = input("Введите ID пользователя VK: ").strip()
+        if not user_input:
+            print("ID пользователя не может быть пустым!")
+            continue
+            
+        try:
+            user_id = validate_and_clean_user_id(user_input)
+            print(f"Обрабатываем пользователя с ID: {user_id}")
             break
-        print("ID пользователя не может быть пустым!")
+        except ValueError as e:
+            print(f"{e}")
+            continue
     
     while True:
         count_input = input("Количество фотографий (по умолчанию 5): ").strip()
@@ -435,7 +609,6 @@ def get_tokens_from_env() -> Tuple[str, str]:
 def main():
     """Основная функция программы."""
     try:
-        # Получаем токены из переменных окружения
         vk_token, yandex_token = get_tokens_from_env()
         
         user_id, count = get_user_input()
@@ -448,18 +621,33 @@ def main():
             print(f"Папка: {result['folder_name']}")
             print(f"JSON: {result['json_file']}")
             print(f"Загружено: {result['uploaded_photos']} фотографий")
+            
+            if result['uploaded_photos'] < result['total_photos']:
+                failed_count = result['total_photos'] - result['uploaded_photos']
+                print(f" Внимание: {failed_count} фотографий не удалось загрузить")
         else:
             print(f"\n Ошибка: {result['message']}")
             sys.exit(1)
             
     except ValueError as e:
-        print(f"\nОшибка конфигурации: {e}")
+        print(f"\n Ошибка конфигурации: {e}")
+        print("\n Инструкция по настройке:")
+        print("1. Создайте файл .env в папке с программой")
+        print("2. Добавьте в него строки:")
+        print("   VK_TOKEN=ваш_vk_токен")
+        print("   YANDEX_TOKEN=ваш_яндекс_токен")
+        print("3. Запустите программу снова")
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\n\n Операция прервана пользователем")
+        print("\n\nОперация прервана пользователем")
         sys.exit(1)
     except Exception as e:
         logger.error(f"Неожиданная ошибка: {e}")
+        print(f"\nПроизошла неожиданная ошибка: {e}")
+        print("Пожалуйста, проверьте:")
+        print("• Подключение к интернету")
+        print("• Правильность токенов")
+        print("• Доступность VK и Яндекс.Диск")
         sys.exit(1)
 
 
